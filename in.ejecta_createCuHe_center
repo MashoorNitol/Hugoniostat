@@ -1,0 +1,216 @@
+# Cu vs Cu + He direct flyre comparison 
+# Sample is monitored using several parameters.
+
+# This is the final shock strength in A per ps
+# #first shock strength
+ variable        shock equal 15
+ variable        oblq equal 0
+ variable        ratio equal ${oblq}/${shock}
+# temperature for the shot
+ variable        temprun equal 300
+# 
+variable runfor equal 100000
+
+variable x equal 400
+variable y equal 400
+variable z equal 2000
+
+variable        T equal "v_z*2/3"
+variable        F equal "v_T*0.5"
+variable        Up equal "v_shock"
+variable        Tu equal "v_Up*-2/3"
+variable        Fu equal "v_Up*4/3"
+
+variable orient string 111
+#file name
+variable name string CuHe_SingleXtal${orient}_Up1250
+log log.${name}
+
+variable time_step              equal 0.002 # time step in pico seconds
+#these are the tdamp and pdamp that we put in NPT
+variable tdamp                  equal "v_time_step*100"  # DO NOT CHANGE
+variable pdamp                  equal "v_time_step*1000"  # DO NOT CHANGE
+variable time_eq                equal 1000 #5000  # time steps for equilibration
+variable time_min               equal 1000 #5000  # tim e steps for minimization
+timestep ${time_step}
+
+#(1) Initialization
+
+units		metal
+boundary	p p p
+atom_style	atomic
+neighbor	1.0 bin
+neigh_modify	every 1 delay 2 check yes
+
+include z${orient}
+
+variable latparam equal 3.615
+
+variable xsize1 equal "sqrt(v_1x1^2 + v_1x2^2 + v_1x3^2)"
+variable ysize1 equal "sqrt(v_1y1^2 + v_1y2^2 + v_1y3^2)"
+variable zsize1 equal "sqrt(v_1z1^2 + v_1z2^2 + v_1z3^2)"
+
+variable sx equal "ceil(v_x/v_latparam/v_xsize1/2)"
+variable sy equal "ceil(v_y/v_latparam/v_ysize1/2)"
+variable szl equal "ceil(v_F/v_latparam/v_zsize1)"
+variable szr equal "ceil(v_T/v_latparam/v_zsize1)"
+
+
+lattice fcc ${latparam} orient x  ${1x1} ${1x2} ${1x3} orient y  ${1y1} ${1y2} ${1y3} orient z  ${1z1} ${1z2} ${1z3} spacing ${xsize1} ${ysize1} ${zsize1}
+region box block -${sx} ${sx} -${sy} ${sy} -${szl} ${szr} units lattice
+
+create_box	3 box
+create_atoms	1 box 
+
+pair_style eam/alloy
+pair_coeff * * CuNbHe_ZBL.eam.alloy Cu Nb He
+
+
+### He additions here
+variable smallestbubble equal 4
+variable largestbubble equal 12
+variable bubbletointer equal 0.8   #0.5 is equal parts bubbles and interstitial
+variable bubblefill equal 2      #ratio for atomreplacement inside bubbles
+variable targconc equal 0.015
+##jump SELF after   #noHe   #if conc is 0
+variable targbub equal v_targconc*v_bubbletointer
+variable targinter equal v_targconc*(1-v_bubbletointer)
+group Cu type 1
+group He type 3
+run 0
+
+variable c1Cu equal "count(Cu)"
+variable c1He equal "count(He)"
+variable c1total equal "count(all)"
+
+run 0
+
+#### Change comments to place He in FLyer/Target/Both  ######
+variable zHemin equal 500
+variable zHemax equal 1000
+
+variable counter loop 123456789  
+label loop
+
+variable randomx equal "random(xlo+v_largestbubble,xhi-v_largestbubble,v_counter)"
+variable randomy equal "random(ylo+v_largestbubble,yhi-v_largestbubble,v_counter)"
+
+#variable randomz equal "random(v_zHemin+v_largestbubble,zHemax-v_largestbubble,v_counter)"    #bubbles in specified Z region
+#variable randomz equal "random(zlo+v_largestbubble,0-v_largestbubble,v_counter)"    #bubbles only in flyer
+variable randomz equal "random(0+v_largestbubble,zhi-v_largestbubble,v_counter)"   #bubbles only in target
+#variable randomz equal "random(zlo+v_largestbubble,zhi-v_largestbubble,v_counter)"   #bubbles everywhere
+
+variable randomr equal "random(v_smallestbubble, v_largestbubble,v_counter)"
+
+region void sphere ${randomx} ${randomy} ${randomz} ${randomr} units box
+group void region void
+variable c1V equal "count(void)"
+variable c2V equal round(${c1V}*${bubblefill})
+delete_atoms region void
+create_atoms 3 random ${c2V} ${counter} void
+variable c1V equal "count(void)"
+variable c2V equal ${c1V}
+group Cu type 1
+group He type 3
+
+print "Count He ${c1He}"
+region void delete
+group void delete
+
+variable crit equal v_c1He/v_c1total
+if "${crit} > ${targbub}" then "jump SELF after" else " "
+next counter
+jump SELF loop
+
+label after
+
+print "Done making bubbles"
+
+######## Now create the interstitial content desired"
+variable thismuchHe equal "round((v_c1Cu*v_targinter)/(1-v_targinter))"   #v_c1He*v_bubbletointer
+run 0
+create_atoms 3 random ${thismuchHe} 12345 box
+
+#label to jump to to skip He creation
+label noHe
+
+fix             3 all box/relax aniso 0.0 vmax 1.0e-4 nreset 100
+thermo          25
+thermo_style    custom atoms step temp pe etotal px:wx pyy pzz lx ly lz
+minimize        0.0 1.0e-6 ${time_min} ${time_min}
+unfix           3
+
+#equilibration 
+velocity        all create 600.0 482748 dist gaussian
+fix             T all npt temp 300 ${temprun} ${tdamp} aniso 0 0 ${pdamp}
+#fix             T all npt temp 300 ${temprun} ${tdamp} iso 0 0 ${pdamp}
+run ${time_eq}
+unfix T
+
+write_data data.${name}
+
+fix		1 all nve
+
+compute 2 all centro/atom 12
+compute 3 all pe/atom
+compute 4 all stress/atom NULL pair
+compute 2dT all temp/partial 1 1 0
+variable whattimeisit atom step 
+
+thermo_style custom step temp atoms c_2dT ke pe etotal press pxx pyy pzz pxy pxz pyz ly lx lz vol tpcpu spcpu zlo zhi
+thermo_modify	lost warn norm yes
+thermo 		100
+
+variable ps equal "step"
+variable zl equal "zlo"
+variable zh equal "zhi"
+fix VISAR all print 250 "${ps} ${zl} ${zh}" file VISAR_${name}.txt screen no
+
+variable tpercpu equal "tpcpu"
+variable spercpu equal "spcpu"
+variable pa equal "atoms"
+
+fix TIMING all print 1000 "${ps} ${pa} ${tpercpu} ${spercpu}" file TIMING_${name}.txt screen no
+
+#compute vd all chunk/atom bin/3d x lower 2 y lower 2 z lower 2 units lattice
+#fix fvd all ave/chunk 1 1 500 vd v_whattimeisit density/number vx vy vz c_4[1] c_4[2] c_4[3] file Elements_3dbin_${name}.txt
+
+compute bin all chunk/atom bin/1d z lower 10 units box
+fix fbin all ave/chunk 1 1 500 bin v_whattimeisit density/number vx vy vz c_3 c_4[1] c_4[2] c_4[3] file Spallprofile_${name}_zbin.txt
+
+reset_timestep 0
+
+thermo 		100
+ 
+dump eve all custom 2500 dump.eve_${name}.* id type x y z vx vy vz c_3 c_4[1] c_4[2] c_4[3] #c_4[4] c_4[5] c_4[6]
+
+region st block INF INF -20 20 INF INF units box
+dump sli all custom 1000 dump.sli_${name}.* id type x y z vx vy vz c_3 c_4[1] c_4[2] c_4[3]
+#dump_modify sli thresh y > -20
+#dump_modify sli thresh y < 20
+dump_modify sli region st
+dump_modify sli region st
+
+
+
+region          flyer block INF INF INF INF INF 0 units box
+group flyer region flyer
+
+region          target block INF INF INF INF 0 INF units box
+group target region target
+
+### make a gap if desired
+#region gap block INF INF INF INF -0.5 0.5 units box
+#group gap region gap
+#delete_atoms group gap
+
+velocity flyer set 0.0 0.0 ${Fu} sum yes units box
+velocity target set 0.0 0.0 ${Tu} sum yes units box
+
+change_box all boundary p p s
+
+
+run ${runfor}
+
+
+

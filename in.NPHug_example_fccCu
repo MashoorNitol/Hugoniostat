@@ -1,0 +1,157 @@
+## Method Addapted into lammps from Ravelo, Holian, Germann, and Lomdahl, PRB 70 014103 (2004)
+## ENH 01/09/19 - updated to include detailed comments
+## ENH 10/12/17 - modified to be able to call from external script
+## ENH 06/02/17 - modified to automatically input the correct initial conditions based on the state of the system 
+
+#### these values can be uncommented to run a single scan
+#variable P equal 50
+#variable dim equal 150
+#variable pdamp equal 15     		#larger values of pdamp take the shock longer to "shock up". relationship between pdamp and shock time is non-linear 
+									#variable that significantly influence rise time: sample dimension, material stiffness, initial temperature
+									#as starting points, for a shock rise time <5ps, values for metals are ~75,25,10 for 500k, 1.5M, 5.5M atoms respectively at T_init=300K 
+#variable drag equal 0
+
+#### nams for storage, first has a constant name to put final states into a single file and the second is for individual run evolutions
+variable cname string NPHug_fccCu
+variable pname string ${cname}_d${dim}_pda${pdamp}_dr${drag}
+variable vname string ${cname}_P${P}_d${dim}_pda${pdamp}_dr${drag}
+log log.${vname}
+
+units           metal
+boundary        p p p       							##both created and loaded systems must be fully periodic for code to work
+atom_style	atomic
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 2 check yes
+
+
+############################### CREATING SINGLE CRYSTAL FROM SCRATCH #############################################
+variable        latparam equal 4.961
+
+#dimensions can be altered from cubic by modifying below
+variable x equal ${dim}
+variable y equal ${dim}
+variable z equal ${dim}
+
+include z100
+
+variable xsize1 equal "sqrt(v_1x1^2 + v_1x2^2 + v_1x3^2)"
+variable ysize1 equal "sqrt(v_1y1^2 + v_1y2^2 + v_1y3^2)"
+variable zsize1 equal "sqrt(v_1z1^2 + v_1z2^2 + v_1z3^2)"
+
+variable sx equal "ceil(v_x/v_latparam/v_xsize1)"
+variable sy equal "ceil(v_y/v_latparam/v_ysize1)"
+variable sz equal "ceil(v_z/v_latparam/v_zsize1)"
+
+lattice fcc ${latparam} orient x  ${1x1} ${1x2} ${1x3} orient y  ${1y1} ${1y2} ${1y3} orient z  ${1z1} ${1z2} ${1z3} spacing ${xsize1} ${ysize1} ${zsize1}
+region whole block 0 ${sx} 0 ${sy} 0 ${sz} units lattice
+
+create_box     2 whole
+create_atoms   1 region whole
+
+#mass           * 1.0   #reminder to include mass if necessary
+pair_style eam/alloy
+pair_coeff * * CuNbHe_ZBL.eam.alloy Cu He
+
+
+####### INITIAL RELAXATION to 300 K and P=0 GPa  ##############
+## Quickly relax box dimensions as a check
+fix             3 all box/relax aniso 0.0 vmax 1.0e-4 nreset 100
+thermo          25
+thermo_style	custom step temp pe etotal pxx pyy pzz lx ly lz 
+minimize	0.0 1.0e-6 1000 1000
+unfix 		3
+
+reset_timestep 0
+velocity        all create 300 87287 mom yes rot yes dist gaussian
+fix npt all npt temp 300 300 0.05 aniso 0 0 .05  		## aniso is preferred to iso for systems with anisotropy. iso fine for [001] cubic crystals
+run 5000   												## may need to adjust aniso damp and timestep to reach equil. 
+unfix npt
+
+
+########### LOADING A DATA FILE ###################
+#atom creation can be skipped if a read_data command is used below
+#for this scape skip region and atom creation, but keep the defined lattice. 
+#read_data data.example
+
+
+
+####SETTING UP NPHug Parameters
+#timestep should be <0.0025 for most metals. 
+timestep        0.002
+reset_timestep 0
+
+####need this section to grab run 0 values to feed into initial condition paramters. For multi-shocks or states or to evluate differnt RH jumps, say from a pre-compressed state or to better evaluate elastic vs plastic conditions these will need to be modified. 
+thermo_style custom step temp vol ke epair etotal pzz  	##need these to grab run 0 values
+fix nve all nve 
+run 0 
+unfix nve
+####initial values grabbed
+
+variable pbar equal "v_P*10000"   						##reminder that P inputs are in GPa, this converts to metal units: bars
+fix myhug all nphug temp 1.0 1.0 10.0 z ${pbar} ${pbar} ${pdamp} drag ${drag} #tchain 1 pchain 0          ##tchain and pchain are defaulted to zero values. Mainly useful for particularly non-steady shock conditions and systems with lots of dissorder
+variable ezero equal etotal
+variable volzero equal vol
+
+##input initial conditions from current simulation 
+fix_modify myhug e0 ${ezero} p0 0.0 v0 ${volzero}
+## Add fix energy to ouput etotal
+fix_modify myhug energy yes 
+
+## Define output variable
+variable dele  equal f_myhug[1] # energy delta [temperature]
+variable us    equal f_myhug[2] # shock velocity [distance/time]
+variable up    equal f_myhug[3] # particle velocity [distance/time]
+variable pzz   equal pzz  # longitudinal stress
+variable pxx   equal pxx  # axial stress
+variable pyy   equal pyy  # axial stress
+variable tau equal 0.5*(pzz-0.5*(pxx+pyy)) # shear stress
+variable time equal dt*step
+variable T equal temp
+variable length equal lz
+
+thermo          50
+thermo_style custom step temp vol ke epair etotal pzz v_tau lz f_myhug v_dele v_us v_up
+
+##prints out single run time evolution. Useful for tracking the effects of pdamp and drag on how steep the "shock front" is. 
+fix stress all print 10 "${time} ${pzz} ${tau} ${us} ${up} ${T} ${pxx} ${pyy} ${length}" screen no append stress_vs_t_${vname}.txt title 'time pzz tau us up T pxx pyy lz'
+
+compute 3 all pe/atom
+compute 4 all stress/atom NULL ke virial 
+#compute 5 all cna/atom 3.9
+#compute 2dT all temp/partial 1 1 0
+
+dump eve all custom 5000 dump.eve_${vname}.* id type x y z vx vy vz c_3 c_4[1] c_4[2] c_4[3]
+
+##this dump tracks constant id atoms from a middle perpanducular slice
+region st block INF INF 0 25 INF INF units box
+dump sli all custom 2500 dump.sli_${vname}.* id type x y z vx vy vz c_3 c_4[1] c_4[2] c_4[3]
+#dump_modify sli thresh y > -18
+#dump_modify sli thresh y < 18
+dump_modify sli region st
+dump_modify sli region st
+
+
+##prints out single run histories for all states achieved. Useful for evaluating path dependence. First output seperates all seperate files for all NPHug variables. Second ignores P, thus provides a complete look at the states achieved by all runs
+##useful for evaluating path dependancy
+fix printer all print 50 "${pzz} ${tau} ${us} ${up} ${volzero} ${T} ${pxx} ${pyy} ${length}" append Hugoniostat_${vname}
+fix printer2 all print 50 "${pzz} ${tau} ${us} ${up} ${volzero} ${T} ${pxx} ${pyy} ${length}" append Hugoniostat_${pname}
+
+run		50000 
+
+##alternatively, a series of data files can be written out as a function of "pulse duration"
+#run             25000 start 0 stop 100000
+#write_data data.${vname}_50ps
+#run             25000 start 0 stop 100000
+#write_data data.${vname}_100ps
+#run             25000 start 0 stop 100000
+#write_data data.${vname}_150ps
+#run             25000 start 0 stop 100000
+#write_data data.${vname}_200ps
+
+##prints out final values at the end of a run. Seperates Hugoniots with different dimensions and damping values as they are the primary differntiators.
+print "${pzz} ${tau} ${us} ${up} ${volzero} ${T} ${pxx} ${pyy} ${length}" append Hugoniostat_final_${pname} 
+write_data data.${vname}_100ps
+
+print "Jobs done"
+
